@@ -1,5 +1,6 @@
 [build]
 provider = "python"
+version = "3.12"
 
 [phases.setup]
 nixPkgs = ["ffmpeg"]
