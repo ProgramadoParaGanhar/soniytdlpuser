@@ -1,11 +1,12 @@
 import logging
 import os
 import asyncio
+import random
 import hashlib
 from urllib.parse import urlparse
 from typing import Optional
 
-from telegram import Update, Bot
+from telegram import Update, InputFile, Bot, InputMediaDocument, InputMediaAudio
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 import yt_dlp
@@ -23,18 +24,27 @@ file_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(file_handler)
 
+# Constantes da API
+MAX_PREMIUM_PARTS = 4000  # Valor hipotético, ajustar conforme config
+MAX_REGULAR_PARTS = 2000  # Valor hipotético, ajustar conforme config
+PART_SIZE = 524288  # 512KB
+BIG_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
+
 # Configurações
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
-FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
+TOKEN = os.getenv("TELEGRAM_aTOKEN")  # Mantenha assim, mas confira o nome da variável
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2 * 1024 * 1024 * 1024))  # 2GB
-TIMEOUT_SECONDS = 1000  # 16 minutos
+FFMPEG_PATH = os.getenv("FFMPEG_PATH")
 
 if not TOKEN:
     logger.error("Telegram bot token not configured.")
     exit()
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+TIMEOUT_SECONDS = 1000  # 16 minutos
+
+class UploadError(Exception):
+    pass
 
 def is_valid_url(url: str) -> bool:
     """Valida uma URL."""
@@ -58,59 +68,147 @@ def compute_md5(file_path: str) -> str:
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-def create_progress_hook(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
-    """
-    Retorna uma função progress_hook que atualiza a mensagem do Telegram
-    com informações de progresso do download.
-    """
-    def progress_hook(progress: dict):
-        try:
-            if progress.get('status') == 'downloading':
-                downloaded = progress.get('downloaded_bytes', 0)
-                total = progress.get('total_bytes', 1)  # evita divisão por zero
-                percent = downloaded / total * 100
-                eta = progress.get('eta', 0)
-                text = (
-                    f"⏳ **Baixando...**\n"
-                    f"Progresso: {percent:.2f}%\n"
-                    f"{downloaded / 1024:.2f} KB de {total / 1024:.2f} KB\n"
-                    f"ETA: {eta} s"
-                )
-                # Atualiza a mensagem de forma segura no loop assíncrono
-                asyncio.run_coroutine_threadsafe(
-                    context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=text,
-                        parse_mode="Markdown"
-                    ),
-                    context.application.loop
-                )
-            elif progress.get('status') == 'finished':
-                text = "✅ Download concluído!"
-                asyncio.run_coroutine_threadsafe(
-                    context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=text
-                    ),
-                    context.application.loop
-                )
-        except Exception as e:
-            logger.error(f"Erro no progress hook: {e}")
-    return progress_hook
+async def upload_file_part(
+        bot: Bot,
+        file_id: int,
+        part_index: int,
+        bytes_data: bytes,
+        total_parts: int,
+        is_premium: bool
+) -> bool:
+    """Faz o upload de uma parte do arquivo."""
+    try:
+        if total_parts > (MAX_PREMIUM_PARTS if is_premium else MAX_REGULAR_PARTS):
+            raise UploadError("Limite de partes excedido para o tipo de conta")
 
-async def download_media(url: str, user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_audio: bool = False) -> Optional[str]:
-    """Faz o download de mídia usando yt-dlp com atualização de progresso."""
+        if len(bytes_data) > PART_SIZE and part_index != total_parts - 1:
+            raise UploadError("Tamanho da parte excedeu 512KB")
+
+        if len(bytes_data) == 0:
+            raise UploadError("Parte do arquivo vazia")
+
+        if total_parts > 1:
+            await bot.send(
+                method="upload.saveBigFilePart" if total_parts * PART_SIZE > BIG_FILE_THRESHOLD else "upload.saveFilePart",
+                data={
+                    "file_id": file_id,
+                    "file_part": part_index,
+                    "file_total_parts": total_parts,
+                    "bytes": bytes_data
+                }
+            )
+        return True
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "flood_premium_wait" in error_msg:
+            raise UploadError("Limite de upload atingido para conta regular") from e
+        logger.error(f"Erro no upload da parte {part_index}: {str(e)}")
+        return False
+
+async def upload_large_file(file_path: str, update: Update, context: ContextTypes.DEFAULT_TYPE, is_audio: bool) -> bool:
+    """Faz o upload de arquivos grandes usando a API do Telegram."""
+    file_size = os.path.getsize(file_path)
+    total_parts = (file_size + PART_SIZE - 1) // PART_SIZE
+    file_id = random.getrandbits(64)
+    use_big_file = file_size > BIG_FILE_THRESHOLD
+    md5_checksum = compute_md5(file_path) if not use_big_file else None
+    is_premium = False  # Implementar lógica de verificação de Premium
+
+    logger.info(f"Iniciando upload de {file_path} ({total_parts} partes)")
+
+    try:
+        # Upload paralelo com até 4 partes simultâneas
+        semaphore = asyncio.Semaphore(4)
+
+        async def upload_part(part_index: int):
+            async with semaphore:
+                with open(file_path, 'rb') as f:
+                    f.seek(part_index * PART_SIZE)
+                    data = f.read(PART_SIZE)
+
+                for attempt in range(3):
+                    success = await upload_file_part(
+                        context.bot,
+                        file_id,
+                        part_index,
+                        data,
+                        total_parts,
+                        is_premium
+                    )
+                    if success:
+                        return
+                    await asyncio.sleep(2 ** attempt)
+                raise UploadError(f"Falha no upload da parte {part_index}")
+
+        tasks = [upload_part(i) for i in range(total_parts)]
+        await asyncio.gather(*tasks)
+
+        # Constrói o objeto InputFile correto
+        input_file = {
+            "_": "InputFileBig" if use_big_file else "InputFile",
+            "id": file_id,
+            "parts": total_parts,
+            "name": os.path.basename(file_path)
+        }
+        if not use_big_file:
+            input_file["md5_checksum"] = md5_checksum
+
+        # Envia a mídia usando o arquivo carregado
+        media_args = {
+            "media": InputMediaDocument(media=input_file) if not is_audio else InputMediaAudio(media=input_file),
+            "chat_id": update.message.chat_id,
+            "caption": "✅ Download concluído!"
+        }
+
+        await context.bot.send_media_group(**media_args)
+        return True
+
+    except UploadError as e:
+        logger.error(f"Erro no upload: {str(e)}")
+        await update.message.reply_text(f"❌ Erro no upload: {str(e)}")
+        return False
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str, is_audio: bool) -> bool:
+    """Gerencia o envio de mídia com fallback para upload tradicional."""
+    file_size = os.path.getsize(file_path)
+
+    if file_size > MAX_FILE_SIZE:
+        await update.message.reply_text("⚠️ Arquivo excede o tamanho máximo permitido")
+        return False
+
+    try:
+        if file_size > 50 * 1024 * 1024:  # 50MB
+            return await upload_large_file(file_path, update, context, is_audio)
+
+        with open(file_path, 'rb') as file:
+            if is_audio:
+                await context.bot.send_audio(
+                    chat_id=update.message.chat_id,
+                    audio=file,
+                    title=os.path.basename(file_path)
+                )
+            else:
+                await context.bot.send_video(
+                    chat_id=update.message.chat_id,
+                    video=file,
+                    caption="✅ Download concluído!",
+                    supports_streaming=True
+                )
+        return True
+    except Exception as e:
+        logger.error(f"Erro no envio: {str(e)}")
+        await update.message.reply_text(f"❌ Erro no envio: {str(e)}")
+        return False
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+async def download_media(url: str, user_id: int, audio_only: bool = False) -> str:
+    """Faz o download de mídia usando yt-dlp."""
     user_dir = create_user_download_dir(user_id)
-
-    # Envia uma mensagem inicial e guarda o message_id para atualização
-    progress_message = await context.bot.send_message(chat_id=chat_id, text="⏳ Iniciando download...")
-    message_id = progress_message.message_id
-
-    # Cria o hook de progresso
-    progress_hook = create_progress_hook(context, chat_id, message_id)
-
     ydl_opts = {
         'ffmpeg_location': FFMPEG_PATH,
         'outtmpl': os.path.join(user_dir, '%(title)s.%(ext)s'),
@@ -119,13 +217,12 @@ async def download_media(url: str, user_id: int, context: ContextTypes.DEFAULT_T
         'cookiefile': os.getenv("COOKIES_PATH"),
         'user_agent': os.getenv("USER_AGENT"),
         'nocheckcertificate': True,
-        'format': 'bestaudio/best' if is_audio else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
-        'progress_hooks': [progress_hook],
+        'format': 'bestaudio/best' if audio_only else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192'
-        }] if is_audio else []
+        }] if audio_only else []
     }
 
     try:
@@ -134,63 +231,25 @@ async def download_media(url: str, user_id: int, context: ContextTypes.DEFAULT_T
             filename = ydl.prepare_filename(info)
             return filename if os.path.exists(filename) else None
     except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=f"❌ Erro no download: {str(e)}"
-        )
-        logger.error(f"Erro no download: {e}")
+        logger.error(f"Erro no download: {str(e)}")
         raise
 
-async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str, is_audio: bool) -> bool:
-    """Envia a mídia para o usuário utilizando os métodos padrão da API do Telegram."""
-    file_size = os.path.getsize(file_path)
-    if file_size > MAX_FILE_SIZE:
-        await update.message.reply_text("⚠️ Arquivo excede o tamanho máximo permitido")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        return False
-
-    try:
-        with open(file_path, 'rb') as file:
-            if is_audio:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=file,
-                    title=os.path.basename(file_path)
-                )
-            else:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=file,
-                    caption="✅ Download concluído!",
-                    supports_streaming=True
-                )
-        return True
-    except Exception as e:
-        logger.error(f"Erro no envio: {e}")
-        await update.message.reply_text(f"❌ Erro no envio: {e}")
-        return False
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, is_audio: bool):
-    """Processa uma URL recebida, realizando o download com feedback de progresso e enviando a mídia."""
+    """Processa uma URL recebida."""
     user = update.message.from_user
-    chat_id = update.effective_chat.id
     try:
         await update.message.reply_text("⏳ Processando seu pedido...")
-        file_path = await download_media(url, user.id, context, chat_id, is_audio)
+        file_path = await download_media(url, user.id, is_audio)
 
         if not file_path:
             raise ValueError("Falha no download do arquivo")
 
         if not await send_media(update, context, file_path, is_audio):
             await update.message.reply_text("❌ Falha ao enviar o arquivo")
+
     except Exception as e:
-        logger.error(f"Erro geral: {e}")
-        await update.message.reply_text(f"❌ Erro: {e}")
+        logger.error(f"Erro geral: {str(e)}")
+        await update.message.reply_text(f"❌ Erro: {str(e)}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler para /start."""
@@ -208,7 +267,7 @@ async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_url(update, context, url, True)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler para mensagens contendo URLs."""
+    """Handler para mensagens com URLs."""
     url = update.message.text
     if not is_valid_url(url):
         await update.message.reply_text("⚠️ URL inválida")
