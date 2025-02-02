@@ -34,7 +34,7 @@ BIG_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 TOKEN = os.getenv("TELEGRAM_TOKEN")  # Mantenha assim, mas confira o nome da variável
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2 * 1024 * 1024 * 1024))  # 2GB
-FFMPEG_PATH = os.getenv("FFMPEG_PATH")
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "/nix/var/nix/profiles/default/bin/ffmpeg")
 
 if not TOKEN:
     logger.error("Telegram bot token not configured.")

@@ -1,0 +1,5 @@
+[build]
+provider = "python"
+
+[phases.setup]
+nixPkgs = ["ffmpeg"]
