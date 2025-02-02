@@ -31,7 +31,7 @@ PART_SIZE = 524288  # 512KB
 BIG_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 
 # Configurações
-TOKEN = os.getenv("TELEGRAM_aTOKEN")  # Mantenha assim, mas confira o nome da variável
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # Mantenha assim, mas confira o nome da variável
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2 * 1024 * 1024 * 1024))  # 2GB
 FFMPEG_PATH = os.getenv("FFMPEG_PATH")
