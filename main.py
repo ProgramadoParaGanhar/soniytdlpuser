@@ -40,7 +40,8 @@ if not TOKEN:
     logger.error("Telegram bot token not configured.")
     exit()
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join("/tmp", "downloads"))  # Usando /tmp
+
 TIMEOUT_SECONDS = 1000  # 16 minutos
 
 class UploadError(Exception):
