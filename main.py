@@ -1,16 +1,15 @@
+import asyncio
+import hashlib
 import logging
 import os
-import asyncio
 import random
-import hashlib
 from urllib.parse import urlparse
-from typing import Optional
 
-from telegram import Update, InputFile, Bot, InputMediaDocument, InputMediaAudio
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.request import HTTPXRequest
 import yt_dlp
 from dotenv import load_dotenv
+from telegram import Update, Bot, InputMediaDocument, InputMediaAudio
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
